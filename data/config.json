@@ -1,0 +1,6 @@
+{
+  "id": "remote-001",
+  "name": "RemoteBox",
+  "channel": 11,
+  "backlightBrightness": 50
+}
