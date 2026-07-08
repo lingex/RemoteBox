@@ -34,6 +34,8 @@ constexpr uint8_t LCD_BL_PWM_MAX = (1 << LCD_BL_PWM_BITS) - 1;
 constexpr char CONFIG_PATH[] = "/config.json";
 constexpr char DEFAULT_ID[] = "remote-001";
 constexpr char DEFAULT_NAME[] = "RemoteBox";
+constexpr char DEFAULT_TO[] = "IRStation-01";
+constexpr char DEFAULT_DATA_JSON[] = "{}";
 constexpr char TRIGGER_COMMAND[] = "power";
 constexpr uint8_t DEFAULT_CHANNEL = 1;
 constexpr uint8_t MIN_CHANNEL = 1;
@@ -41,6 +43,10 @@ constexpr uint8_t MAX_CHANNEL = 13;
 constexpr uint8_t DEFAULT_BACKLIGHT_BRIGHTNESS = 50;
 constexpr size_t MAX_ID_LEN = 32;
 constexpr size_t MAX_NAME_LEN = 32;
+constexpr size_t MAX_TO_LEN = 32;
+constexpr size_t MAX_DATA_JSON_LEN = 96;
+constexpr size_t ESPNOW_PAYLOAD_MAX_LEN = 250;
+constexpr size_t MAX_CANONICAL_OBJECT_KEYS = 24;
 
 constexpr uint32_t RESULT_VISIBLE_MS = 3UL * 1000UL;
 constexpr uint32_t USB_STATUS_VISIBLE_MS = 3UL * 1000UL;
@@ -63,6 +69,8 @@ constexpr uint8_t ESPNOW_BROADCAST_MAC[6] = {
 struct DeviceConfig {
   String id = DEFAULT_ID;
   String name = DEFAULT_NAME;
+  String to = DEFAULT_TO;
+  String dataJson = DEFAULT_DATA_JSON;
   uint8_t channel = DEFAULT_CHANNEL;
   uint8_t backlightBrightness = DEFAULT_BACKLIGHT_BRIGHTNESS;
 };
@@ -146,6 +154,22 @@ uint8_t clampPercent(int value, uint8_t fallback, bool &changed) {
   return static_cast<uint8_t>(value);
 }
 
+String compactJsonOrDefault(JsonVariantConst value, const char *fallback,
+                            size_t maxLen, bool &changed) {
+  String output;
+  if (value.isNull()) {
+    output = fallback;
+    changed = true;
+  } else {
+    serializeJson(value, output);
+    if (output.isEmpty() || output.length() > maxLen) {
+      output = fallback;
+      changed = true;
+    }
+  }
+  return output;
+}
+
 uint8_t backlightDutyForBrightness(uint8_t brightness) {
   const uint8_t duty =
       (static_cast<uint16_t>(brightness) * LCD_BL_PWM_MAX + 50) / 100;
@@ -217,9 +241,108 @@ uint32_t crc32Update(uint32_t crc, uint8_t data) {
   return crc;
 }
 
-String commandChecksum(const char *cmd, uint8_t batPercent, const String &uid) {
-  String source = config.id + "|" + config.name + "|" + cmd + "|" +
-                  String(batPercent) + "|" + uid;
+void appendJsonString(const char *value, String &output) {
+  output += '"';
+  for (const char *p = value; *p; ++p) {
+    const char c = *p;
+    switch (c) {
+    case '"':
+      output += "\\\"";
+      break;
+    case '\\':
+      output += "\\\\";
+      break;
+    case '\b':
+      output += "\\b";
+      break;
+    case '\f':
+      output += "\\f";
+      break;
+    case '\n':
+      output += "\\n";
+      break;
+    case '\r':
+      output += "\\r";
+      break;
+    case '\t':
+      output += "\\t";
+      break;
+    default:
+      if (static_cast<uint8_t>(c) < 0x20) {
+        char escaped[7];
+        snprintf(escaped, sizeof(escaped), "\\u%04X",
+                 static_cast<unsigned int>(static_cast<uint8_t>(c)));
+        output += escaped;
+      } else {
+        output += c;
+      }
+      break;
+    }
+  }
+  output += '"';
+}
+
+void appendCanonicalJson(JsonVariantConst value, String &output,
+                         bool topLevel = false) {
+  if (value.is<JsonObjectConst>()) {
+    JsonObjectConst object = value.as<JsonObjectConst>();
+    const char *keys[MAX_CANONICAL_OBJECT_KEYS];
+    size_t keyCount = 0;
+
+    for (JsonPairConst pair : object) {
+      const char *key = pair.key().c_str();
+      if (topLevel && strcmp(key, "chk") == 0) {
+        continue;
+      }
+      if (keyCount < MAX_CANONICAL_OBJECT_KEYS) {
+        keys[keyCount++] = key;
+      }
+    }
+
+    for (size_t i = 1; i < keyCount; ++i) {
+      const char *key = keys[i];
+      size_t j = i;
+      while (j > 0 && strcmp(keys[j - 1], key) > 0) {
+        keys[j] = keys[j - 1];
+        --j;
+      }
+      keys[j] = key;
+    }
+
+    output += '{';
+    for (size_t i = 0; i < keyCount; ++i) {
+      if (i > 0) {
+        output += ',';
+      }
+      appendJsonString(keys[i], output);
+      output += ':';
+      appendCanonicalJson(object[keys[i]], output);
+    }
+    output += '}';
+    return;
+  }
+
+  if (value.is<JsonArrayConst>()) {
+    JsonArrayConst array = value.as<JsonArrayConst>();
+    output += '[';
+    bool first = true;
+    for (JsonVariantConst item : array) {
+      if (!first) {
+        output += ',';
+      }
+      first = false;
+      appendCanonicalJson(item, output);
+    }
+    output += ']';
+    return;
+  }
+
+  serializeJson(value, output);
+}
+
+String commandChecksum(JsonDocument &doc) {
+  String source;
+  appendCanonicalJson(doc.as<JsonVariantConst>(), source, true);
   uint32_t crc = 0xFFFFFFFFUL;
   for (size_t i = 0; i < source.length(); ++i) {
     crc = crc32Update(crc, static_cast<uint8_t>(source[i]));
@@ -408,9 +531,11 @@ void saveDefaultConfig() {
     return;
   }
 
-  StaticJsonDocument<192> doc;
+  StaticJsonDocument<256> doc;
   doc["id"] = DEFAULT_ID;
   doc["name"] = DEFAULT_NAME;
+  doc["to"] = DEFAULT_TO;
+  doc["data"] = serialized(DEFAULT_DATA_JSON);
   doc["channel"] = DEFAULT_CHANNEL;
   doc["backlightBrightness"] = DEFAULT_BACKLIGHT_BRIGHTNESS;
   serializeJsonPretty(doc, file);
@@ -423,9 +548,11 @@ bool saveConfig() {
     return false;
   }
 
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<384> doc;
   doc["id"] = config.id;
   doc["name"] = config.name;
+  doc["to"] = config.to;
+  doc["data"] = serialized(config.dataJson);
   doc["channel"] = config.channel;
   doc["backlightBrightness"] = config.backlightBrightness;
   serializeJsonPretty(doc, file);
@@ -446,7 +573,7 @@ void loadConfig() {
     return;
   }
 
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<384> doc;
   DeserializationError err = deserializeJson(doc, file);
   file.close();
 
@@ -459,6 +586,10 @@ void loadConfig() {
   config.id = limitString(doc["id"] | DEFAULT_ID, MAX_ID_LEN, DEFAULT_ID);
   config.name =
       limitString(doc["name"] | DEFAULT_NAME, MAX_NAME_LEN, DEFAULT_NAME);
+  config.to = limitString(doc["to"] | DEFAULT_TO, MAX_TO_LEN, DEFAULT_TO);
+  config.dataJson =
+      compactJsonOrDefault(doc["data"], DEFAULT_DATA_JSON, MAX_DATA_JSON_LEN,
+                           shouldRewrite);
 
   int channel = doc["channel"] | DEFAULT_CHANNEL;
   if (channel < MIN_CHANNEL || channel > MAX_CHANNEL) {
@@ -473,7 +604,9 @@ void loadConfig() {
 
   if (config.id != String(doc["id"] | "") ||
       config.name != String(doc["name"] | "") ||
-      !doc.containsKey("channel") || !doc.containsKey("backlightBrightness")) {
+      config.to != String(doc["to"] | "") ||
+      !doc.containsKey("data") || !doc.containsKey("channel") ||
+      !doc.containsKey("backlightBrightness")) {
     shouldRewrite = true;
   }
 
@@ -533,16 +666,17 @@ SendResult sendEspNowCommand(const char *cmd) {
     }
   }
 
-  StaticJsonDocument<240> doc;
+  StaticJsonDocument<384> doc;
   const String uid = makeCommandUid();
   doc["id"] = config.id;
   doc["uid"] = uid;
-  doc["name"] = config.name;
+  doc["to"] = config.to;
   doc["cmd"] = cmd;
+  doc["dat"] = serialized(config.dataJson);
   doc["bat"] = battery.percent;
-  doc["chk"] = commandChecksum(cmd, battery.percent, uid);
+  doc["chk"] = commandChecksum(doc);
 
-  char payload[240];
+  char payload[ESPNOW_PAYLOAD_MAX_LEN];
   const size_t payloadSize = serializeJson(doc, payload, sizeof(payload));
   if (payloadSize == 0 || payloadSize >= sizeof(payload)) {
     stopRadio();

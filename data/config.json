@@ -1,6 +1,8 @@
 {
   "id": "remote-001",
   "name": "RemoteBox",
+  "to": "IRStation-01",
+  "data": {},
   "channel": 11,
   "backlightBrightness": 50
 }

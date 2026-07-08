@@ -10,7 +10,8 @@ directly on the device. In practice, it is a handheld remote for
 - Sends the `power` command over ESP-NOW broadcast.
 - Adds a per-command `uid` so repeated packets can be deduplicated by the receiver.
 - Sends each command three times with the same payload to improve reliability.
-- Includes a CRC32-style `chk` field covering `id`, `name`, `cmd`, `bat`, and `uid`.
+- Includes a CRC32-style `chk` field covering the whole JSON packet except
+  `chk` itself.
 - Shows battery/status information on an ST7567/U8g2 LCD.
 - Supports USB-powered standby mode and battery-triggered send-and-power-off mode.
 - Allows channel selection from `CH 1` to `CH 13` with the single button.
@@ -48,6 +49,8 @@ device if missing or invalid:
 {
   "id": "remote-001",
   "name": "RemoteBox",
+  "to": "IRStation-01",
+  "data": {},
   "channel": 11,
   "backlightBrightness": 50
 }
@@ -57,6 +60,9 @@ Fields:
 
 - `id`: Sender ID included in every command packet.
 - `name`: Friendly device name shown on the LCD and included in packets.
+- `to`: Target device name or ID included in every command packet.
+- `data`: Extra JSON parameters included in every command packet. Keep it small
+  because ESP-NOW v1 payloads are limited to 250 bytes.
 - `channel`: ESP-NOW channel, valid range `1-13`.
 - `backlightBrightness`: LCD backlight brightness percentage, `0-100`.
 
@@ -95,8 +101,9 @@ Each command is serialized as JSON before sending:
 {
   "id": "remote-001",
   "uid": "00001234-0001-A7F2",
-  "name": "RemoteBox",
+  "to": "IRStation-01",
   "cmd": "power",
+  "dat": {},
   "bat": 86,
   "chk": "1A2B3C4D"
 }
@@ -108,10 +115,18 @@ Notes:
 - All three repeats share the same `uid` and `chk`.
 - The receiver should deduplicate by `id + uid` and only execute a repeated
   command once.
-- `chk` is generated from:
+- `chk` is generated from a canonical JSON representation:
 
-```text
-id | name | cmd | bat | uid
+  - remove the top-level `chk` field
+  - sort object keys alphabetically, recursively
+  - keep array item order unchanged
+  - serialize as compact JSON
+  - calculate CRC32 over that string
+
+For example, the checksum source is shaped like:
+
+```json
+{"bat":86,"cmd":"power","data":{},"id":"remote-001","name":"RemoteBox","to":"IRStation-01","uid":"00001234-0001-A7F2"}
 ```
 
 ## Channel Notes
@@ -170,4 +185,3 @@ pio device monitor
 |-- partitions.csv
 `-- platformio.ini
 ```
-
