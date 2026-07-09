@@ -59,10 +59,10 @@ device if missing or invalid:
 Fields:
 
 - `id`: Sender ID included in every command packet.
-- `name`: Friendly device name shown on the LCD and included in packets.
+- `name`: Friendly device name shown on the LCD.
 - `to`: Target device name or ID included in every command packet.
-- `data`: Extra JSON parameters included in every command packet. Keep it small
-  because ESP-NOW v1 payloads are limited to 250 bytes.
+- `data`: Extra JSON parameters included in every command packet as `dat`.
+  Keep it small because ESP-NOW v1 payloads are limited to 250 bytes.
 - `channel`: ESP-NOW channel, valid range `1-13`.
 - `backlightBrightness`: LCD backlight brightness percentage, `0-100`.
 
@@ -126,7 +126,7 @@ Notes:
 For example, the checksum source is shaped like:
 
 ```json
-{"bat":86,"cmd":"power","data":{},"id":"remote-001","name":"RemoteBox","to":"IRStation-01","uid":"00001234-0001-A7F2"}
+{"bat":86,"cmd":"power","dat":{},"id":"remote-001","to":"IRStation-01","uid":"00001234-0001-A7F2"}
 ```
 
 ## Channel Notes

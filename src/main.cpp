@@ -9,6 +9,8 @@
 #include <esp_wifi.h>
 #include <driver/gpio.h>
 
+#include "Checksum.h"
+
 #ifndef ESP_ARDUINO_VERSION_MAJOR
 #define ESP_ARDUINO_VERSION_MAJOR 2
 #endif
@@ -46,18 +48,17 @@ constexpr size_t MAX_NAME_LEN = 32;
 constexpr size_t MAX_TO_LEN = 32;
 constexpr size_t MAX_DATA_JSON_LEN = 96;
 constexpr size_t ESPNOW_PAYLOAD_MAX_LEN = 250;
-constexpr size_t MAX_CANONICAL_OBJECT_KEYS = 24;
 
 constexpr uint32_t RESULT_VISIBLE_MS = 3UL * 1000UL;
 constexpr uint32_t USB_STATUS_VISIBLE_MS = 3UL * 1000UL;
-constexpr uint32_t USB_BACKLIGHT_IDLE_MS = 15UL * 1000UL;
+constexpr uint32_t USB_BACKLIGHT_IDLE_MS = 9UL * 1000UL;
 constexpr uint32_t POST_BACKLIGHT_OFF_MS = 2UL * 1000UL;
 constexpr uint32_t USB_REFRESH_MS = 700UL;
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 35UL;
 constexpr uint32_t BUTTON_LONG_PRESS_MS = 2UL * 1000UL;
 constexpr uint32_t CHANNEL_SETTINGS_TIMEOUT_MS = 5UL * 1000UL;
 constexpr uint32_t CHANNEL_SETTINGS_RESULT_MS = 1UL * 1000UL;
-constexpr uint32_t BATTERY_REFRESH_MS = 10UL * 1000UL;
+constexpr uint32_t BATTERY_REFRESH_MS = 8UL * 1000UL;
 constexpr uint8_t COMMAND_SEND_ATTEMPTS = 3;
 constexpr uint32_t ESPNOW_SEND_WAIT_MS = 500UL;
 constexpr uint32_t ESPNOW_SEND_GAP_MS = 35UL;
@@ -231,127 +232,6 @@ void stopRadio() {
     esp_wifi_stop();
     wifiRadioStarted = false;
   }
-}
-
-uint32_t crc32Update(uint32_t crc, uint8_t data) {
-  crc ^= data;
-  for (uint8_t i = 0; i < 8; ++i) {
-    crc = (crc >> 1) ^ (0xEDB88320UL & (0UL - (crc & 1UL)));
-  }
-  return crc;
-}
-
-void appendJsonString(const char *value, String &output) {
-  output += '"';
-  for (const char *p = value; *p; ++p) {
-    const char c = *p;
-    switch (c) {
-    case '"':
-      output += "\\\"";
-      break;
-    case '\\':
-      output += "\\\\";
-      break;
-    case '\b':
-      output += "\\b";
-      break;
-    case '\f':
-      output += "\\f";
-      break;
-    case '\n':
-      output += "\\n";
-      break;
-    case '\r':
-      output += "\\r";
-      break;
-    case '\t':
-      output += "\\t";
-      break;
-    default:
-      if (static_cast<uint8_t>(c) < 0x20) {
-        char escaped[7];
-        snprintf(escaped, sizeof(escaped), "\\u%04X",
-                 static_cast<unsigned int>(static_cast<uint8_t>(c)));
-        output += escaped;
-      } else {
-        output += c;
-      }
-      break;
-    }
-  }
-  output += '"';
-}
-
-void appendCanonicalJson(JsonVariantConst value, String &output,
-                         bool topLevel = false) {
-  if (value.is<JsonObjectConst>()) {
-    JsonObjectConst object = value.as<JsonObjectConst>();
-    const char *keys[MAX_CANONICAL_OBJECT_KEYS];
-    size_t keyCount = 0;
-
-    for (JsonPairConst pair : object) {
-      const char *key = pair.key().c_str();
-      if (topLevel && strcmp(key, "chk") == 0) {
-        continue;
-      }
-      if (keyCount < MAX_CANONICAL_OBJECT_KEYS) {
-        keys[keyCount++] = key;
-      }
-    }
-
-    for (size_t i = 1; i < keyCount; ++i) {
-      const char *key = keys[i];
-      size_t j = i;
-      while (j > 0 && strcmp(keys[j - 1], key) > 0) {
-        keys[j] = keys[j - 1];
-        --j;
-      }
-      keys[j] = key;
-    }
-
-    output += '{';
-    for (size_t i = 0; i < keyCount; ++i) {
-      if (i > 0) {
-        output += ',';
-      }
-      appendJsonString(keys[i], output);
-      output += ':';
-      appendCanonicalJson(object[keys[i]], output);
-    }
-    output += '}';
-    return;
-  }
-
-  if (value.is<JsonArrayConst>()) {
-    JsonArrayConst array = value.as<JsonArrayConst>();
-    output += '[';
-    bool first = true;
-    for (JsonVariantConst item : array) {
-      if (!first) {
-        output += ',';
-      }
-      first = false;
-      appendCanonicalJson(item, output);
-    }
-    output += ']';
-    return;
-  }
-
-  serializeJson(value, output);
-}
-
-String commandChecksum(JsonDocument &doc) {
-  String source;
-  appendCanonicalJson(doc.as<JsonVariantConst>(), source, true);
-  uint32_t crc = 0xFFFFFFFFUL;
-  for (size_t i = 0; i < source.length(); ++i) {
-    crc = crc32Update(crc, static_cast<uint8_t>(source[i]));
-  }
-  crc ^= 0xFFFFFFFFUL;
-
-  char output[9];
-  snprintf(output, sizeof(output), "%08lX", static_cast<unsigned long>(crc));
-  return String(output);
 }
 
 String makeCommandUid() {
