@@ -376,8 +376,8 @@ void drawChargeScreen() {
                             static_cast<int32_t>(usbStatusUntilMs - millis()) > 0;
   u8g2.setFont(u8g2_font_7x13_tf);
   drawCenteredString(31, statusActive ? usbStatusLine : String("Ready"));
-  //u8g2.setFont(u8g2_font_6x10_tf);
-  //drawCenteredString(45, "Press to send");
+  u8g2.setFont(u8g2_font_6x10_tf);
+  drawCenteredString(45, "Target: " + String(config.to));
 
   drawFooter(config.name, String("CH ") + String(config.channel));
   u8g2.sendBuffer();
