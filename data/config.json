@@ -2,6 +2,7 @@
   "id": "remote-001",
   "name": "RemoteBox",
   "to": "IRStation-01",
+  "cmd": "power",
   "data": {},
   "channel": 11,
   "backlightBrightness": 50

@@ -37,8 +37,8 @@ constexpr char CONFIG_PATH[] = "/config.json";
 constexpr char DEFAULT_ID[] = "remote-001";
 constexpr char DEFAULT_NAME[] = "RemoteBox";
 constexpr char DEFAULT_TO[] = "IRStation-01";
+constexpr char DEFAULT_CMD[] = "power";
 constexpr char DEFAULT_DATA_JSON[] = "{}";
-constexpr char TRIGGER_COMMAND[] = "power";
 constexpr uint8_t DEFAULT_CHANNEL = 1;
 constexpr uint8_t MIN_CHANNEL = 1;
 constexpr uint8_t MAX_CHANNEL = 13;
@@ -46,6 +46,7 @@ constexpr uint8_t DEFAULT_BACKLIGHT_BRIGHTNESS = 50;
 constexpr size_t MAX_ID_LEN = 32;
 constexpr size_t MAX_NAME_LEN = 32;
 constexpr size_t MAX_TO_LEN = 32;
+constexpr size_t MAX_CMD_LEN = 32;
 constexpr size_t MAX_DATA_JSON_LEN = 96;
 constexpr size_t ESPNOW_PAYLOAD_MAX_LEN = 250;
 
@@ -71,6 +72,7 @@ struct DeviceConfig {
   String id = DEFAULT_ID;
   String name = DEFAULT_NAME;
   String to = DEFAULT_TO;
+  String cmd = DEFAULT_CMD;
   String dataJson = DEFAULT_DATA_JSON;
   uint8_t channel = DEFAULT_CHANNEL;
   uint8_t backlightBrightness = DEFAULT_BACKLIGHT_BRIGHTNESS;
@@ -415,6 +417,7 @@ void saveDefaultConfig() {
   doc["id"] = DEFAULT_ID;
   doc["name"] = DEFAULT_NAME;
   doc["to"] = DEFAULT_TO;
+  doc["cmd"] = DEFAULT_CMD;
   doc["data"] = serialized(DEFAULT_DATA_JSON);
   doc["channel"] = DEFAULT_CHANNEL;
   doc["backlightBrightness"] = DEFAULT_BACKLIGHT_BRIGHTNESS;
@@ -432,6 +435,7 @@ bool saveConfig() {
   doc["id"] = config.id;
   doc["name"] = config.name;
   doc["to"] = config.to;
+  doc["cmd"] = config.cmd;
   doc["data"] = serialized(config.dataJson);
   doc["channel"] = config.channel;
   doc["backlightBrightness"] = config.backlightBrightness;
@@ -467,6 +471,7 @@ void loadConfig() {
   config.name =
       limitString(doc["name"] | DEFAULT_NAME, MAX_NAME_LEN, DEFAULT_NAME);
   config.to = limitString(doc["to"] | DEFAULT_TO, MAX_TO_LEN, DEFAULT_TO);
+  config.cmd = limitString(doc["cmd"] | DEFAULT_CMD, MAX_CMD_LEN, DEFAULT_CMD);
   config.dataJson =
       compactJsonOrDefault(doc["data"], DEFAULT_DATA_JSON, MAX_DATA_JSON_LEN,
                            shouldRewrite);
@@ -485,8 +490,9 @@ void loadConfig() {
   if (config.id != String(doc["id"] | "") ||
       config.name != String(doc["name"] | "") ||
       config.to != String(doc["to"] | "") ||
+      config.cmd != String(doc["cmd"] | "") ||
       !doc.containsKey("data") || !doc.containsKey("channel") ||
-      !doc.containsKey("backlightBrightness")) {
+      !doc.containsKey("cmd") || !doc.containsKey("backlightBrightness")) {
     shouldRewrite = true;
   }
 
@@ -504,7 +510,7 @@ void onEspNowSent(const uint8_t *, esp_now_send_status_t status) {
   espNowSendComplete = true;
 }
 
-SendResult sendEspNowCommand(const char *cmd) {
+SendResult sendEspNowCommand() {
   stopRadio();
 
   if (!WiFi.mode(WIFI_STA)) {
@@ -551,7 +557,7 @@ SendResult sendEspNowCommand(const char *cmd) {
   doc["id"] = config.id;
   doc["uid"] = uid;
   doc["to"] = config.to;
-  doc["cmd"] = cmd;
+  doc["cmd"] = config.cmd;
   doc["dat"] = serialized(config.dataJson);
   doc["bat"] = battery.percent;
   doc["chk"] = commandChecksum(doc);
@@ -619,7 +625,7 @@ SendResult sendTrigger(bool showSendScreen = true) {
   if (showSendScreen) {
     drawSendScreen("Sending...", config.name);
   }
-  const SendResult result = sendEspNowCommand(TRIGGER_COMMAND);
+  const SendResult result = sendEspNowCommand();
   refreshBattery(true);
   if (showSendScreen) {
     drawSendScreen(sendResultText(result), String("CH ") + String(config.channel));

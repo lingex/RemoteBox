@@ -50,6 +50,7 @@ device if missing or invalid:
   "id": "remote-001",
   "name": "RemoteBox",
   "to": "IRStation-01",
+  "cmd": "power",
   "data": {},
   "channel": 11,
   "backlightBrightness": 50
@@ -61,6 +62,7 @@ Fields:
 - `id`: Sender ID included in every command packet.
 - `name`: Friendly device name shown on the LCD.
 - `to`: Target device name or ID included in every command packet.
+- `cmd`: Command value included in every command packet.
 - `data`: Extra JSON parameters included in every command packet as `dat`.
   Keep it small because ESP-NOW v1 payloads are limited to 250 bytes.
 - `channel`: ESP-NOW channel, valid range `1-13`.
@@ -72,14 +74,14 @@ Fields:
 
 When powered by the button without USB:
 
-- Short press/release: send the `power` command, show the result, then power off.
+- Short press/release: send the configured `cmd`, show the result, then power off.
 - Long press for 2 seconds: enter channel settings instead of sending.
 
 ### USB Mode
 
 When USB is connected:
 
-- Short press/release: send the `power` command.
+- Short press/release: send the configured `cmd`.
 - Long press for 2 seconds: enter channel settings.
 - The screen stays available while USB is present and dims after idle time.
 
