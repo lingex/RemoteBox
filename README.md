@@ -47,6 +47,10 @@ device if missing or invalid:
 
 ```json
 {
+  "wifi": {
+    "ssid": "",
+    "password": ""
+  },
   "id": "remote-001",
   "name": "RemoteBox",
   "to": "IRStation-01",
@@ -59,6 +63,10 @@ device if missing or invalid:
 
 Fields:
 
+- `wifi.ssid`: Optional Wi-Fi SSID used by automatic channel detection. When
+  non-empty, channel settings include an `AUTO` item.
+- `wifi.password`: Reserved Wi-Fi password field. Automatic channel detection
+  only scans for the SSID and does not connect to the network.
 - `id`: Sender ID included in every command packet.
 - `name`: Friendly device name shown on the LCD.
 - `to`: Target device name or ID included in every command packet.
@@ -90,7 +98,11 @@ When USB is connected:
 In channel settings:
 
 - Short press: switch to the next channel.
-- Channels cycle as `1 -> 2 -> ... -> 13 -> 1`.
+- Without `wifi.ssid`, channels cycle as `1 -> 2 -> ... -> 13 -> 1`.
+- With `wifi.ssid`, an `AUTO` item appears after channel 13. Saving `AUTO`
+  scans for the configured SSID, selects the channel of the strongest matching
+  access point, and saves the detected channel number. A failed scan leaves the
+  existing channel unchanged.
 - Long press for 2 seconds: save the selected channel and exit.
 - 5 seconds idle: cancel changes and exit.
 - Saving only updates local config; it does not send a test command.

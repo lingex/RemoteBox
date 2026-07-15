@@ -39,6 +39,9 @@ constexpr char DEFAULT_NAME[] = "RemoteBox";
 constexpr char DEFAULT_TO[] = "IRStation-01";
 constexpr char DEFAULT_CMD[] = "power";
 constexpr char DEFAULT_DATA_JSON[] = "{}";
+constexpr char DEFAULT_WIFI_SSID[] = "";
+constexpr char DEFAULT_WIFI_PASSWORD[] = "";
+constexpr uint8_t AUTO_CHANNEL = 0;
 constexpr uint8_t DEFAULT_CHANNEL = 1;
 constexpr uint8_t MIN_CHANNEL = 1;
 constexpr uint8_t MAX_CHANNEL = 13;
@@ -48,6 +51,8 @@ constexpr size_t MAX_NAME_LEN = 32;
 constexpr size_t MAX_TO_LEN = 32;
 constexpr size_t MAX_CMD_LEN = 32;
 constexpr size_t MAX_DATA_JSON_LEN = 96;
+constexpr size_t MAX_WIFI_SSID_LEN = 32;
+constexpr size_t MAX_WIFI_PASSWORD_LEN = 64;
 constexpr size_t ESPNOW_PAYLOAD_MAX_LEN = 250;
 
 constexpr uint32_t RESULT_VISIBLE_MS = 3UL * 1000UL;
@@ -68,7 +73,13 @@ constexpr float BATTERY_DIVIDER_RATIO = 2.0f;
 constexpr uint8_t ESPNOW_BROADCAST_MAC[6] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
+struct WifiConfig {
+  String ssid = DEFAULT_WIFI_SSID;
+  String password = DEFAULT_WIFI_PASSWORD;
+};
+
 struct DeviceConfig {
+  WifiConfig wifi;
   String id = DEFAULT_ID;
   String name = DEFAULT_NAME;
   String to = DEFAULT_TO;
@@ -104,6 +115,17 @@ enum class ButtonEvent {
   None,
   Pressed,
   Released,
+};
+
+enum class WifiChannelScanStatus {
+  Found,
+  NotFound,
+  Error,
+};
+
+struct WifiChannelScanResult {
+  WifiChannelScanStatus status = WifiChannelScanStatus::Error;
+  uint8_t channel = AUTO_CHANNEL;
 };
 
 DeviceConfig config;
@@ -147,6 +169,21 @@ String limitString(const String &value, size_t maxLen, const char *fallback) {
     trimmed.remove(maxLen);
   }
   return trimmed;
+}
+
+String configStringOrEmpty(JsonVariantConst value, size_t maxLen,
+                           bool &changed) {
+  if (!value.is<const char *>()) {
+    changed = true;
+    return "";
+  }
+
+  String output = value.as<const char *>();
+  if (output.length() > maxLen) {
+    output.remove(maxLen);
+    changed = true;
+  }
+  return output;
 }
 
 uint8_t clampPercent(int value, uint8_t fallback, bool &changed) {
@@ -400,10 +437,23 @@ void drawChannelSettingsScreen(uint8_t channel, const String &status) {
   u8g2.clearBuffer();
   drawHeader("SET CH");
   u8g2.setFont(u8g2_font_7x13B_tf);
-  drawCenteredString(31, String("CH ") + String(channel));
+  drawCenteredString(31, channel == AUTO_CHANNEL
+                             ? String("AUTO")
+                             : String("CH ") + String(channel));
   u8g2.setFont(u8g2_font_6x10_tf);
   drawCenteredString(45, status);
   drawFooter("Press Next", "Hold Save");
+  u8g2.sendBuffer();
+}
+
+void drawWifiScanScreen(const String &status, const String &detail) {
+  u8g2.clearBuffer();
+  drawHeader("AUTO CH");
+  u8g2.setFont(u8g2_font_7x13B_tf);
+  drawCenteredString(31, status);
+  u8g2.setFont(u8g2_font_6x10_tf);
+  drawCenteredString(45, detail);
+  drawFooter(config.name, "WiFi scan");
   u8g2.sendBuffer();
 }
 
@@ -413,7 +463,10 @@ void saveDefaultConfig() {
     return;
   }
 
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<512> doc;
+  JsonObject wifi = doc.createNestedObject("wifi");
+  wifi["ssid"] = DEFAULT_WIFI_SSID;
+  wifi["password"] = DEFAULT_WIFI_PASSWORD;
   doc["id"] = DEFAULT_ID;
   doc["name"] = DEFAULT_NAME;
   doc["to"] = DEFAULT_TO;
@@ -431,7 +484,10 @@ bool saveConfig() {
     return false;
   }
 
-  StaticJsonDocument<384> doc;
+  StaticJsonDocument<768> doc;
+  JsonObject wifi = doc.createNestedObject("wifi");
+  wifi["ssid"] = config.wifi.ssid;
+  wifi["password"] = config.wifi.password;
   doc["id"] = config.id;
   doc["name"] = config.name;
   doc["to"] = config.to;
@@ -457,7 +513,7 @@ void loadConfig() {
     return;
   }
 
-  StaticJsonDocument<384> doc;
+  StaticJsonDocument<768> doc;
   DeserializationError err = deserializeJson(doc, file);
   file.close();
 
@@ -466,6 +522,12 @@ void loadConfig() {
     saveDefaultConfig();
     return;
   }
+
+  JsonObjectConst wifi = doc["wifi"].as<JsonObjectConst>();
+  config.wifi.ssid =
+      configStringOrEmpty(wifi["ssid"], MAX_WIFI_SSID_LEN, shouldRewrite);
+  config.wifi.password = configStringOrEmpty(
+      wifi["password"], MAX_WIFI_PASSWORD_LEN, shouldRewrite);
 
   config.id = limitString(doc["id"] | DEFAULT_ID, MAX_ID_LEN, DEFAULT_ID);
   config.name =
@@ -699,7 +761,60 @@ ButtonEvent pollButtonEvent() {
 }
 
 uint8_t nextChannel(uint8_t channel) {
-  return channel >= MAX_CHANNEL ? MIN_CHANNEL : channel + 1;
+  if (channel == AUTO_CHANNEL) {
+    return MIN_CHANNEL;
+  }
+  if (channel >= MAX_CHANNEL) {
+    return config.wifi.ssid.isEmpty() ? MIN_CHANNEL : AUTO_CHANNEL;
+  }
+  return channel + 1;
+}
+
+WifiChannelScanResult scanConfiguredWifiChannel() {
+  WifiChannelScanResult result;
+  if (config.wifi.ssid.isEmpty()) {
+    result.status = WifiChannelScanStatus::NotFound;
+    return result;
+  }
+
+  stopRadio();
+  wifiRadioStarted = true;
+  if (!WiFi.mode(WIFI_STA)) {
+    stopRadio();
+    return result;
+  }
+  WiFi.disconnect();
+  yield();
+
+  const int16_t networkCount = WiFi.scanNetworks(false, true);
+  if (networkCount < 0) {
+    WiFi.scanDelete();
+    stopRadio();
+    return result;
+  }
+
+  int32_t strongestRssi = -1000;
+  for (int16_t i = 0; i < networkCount && i <= UINT8_MAX; ++i) {
+    const uint8_t networkIndex = static_cast<uint8_t>(i);
+    if (WiFi.SSID(networkIndex) != config.wifi.ssid) {
+      continue;
+    }
+
+    const int32_t channel = WiFi.channel(networkIndex);
+    const int32_t rssi = WiFi.RSSI(networkIndex);
+    if (channel >= MIN_CHANNEL && channel <= MAX_CHANNEL &&
+        (result.channel == AUTO_CHANNEL || rssi > strongestRssi)) {
+      result.channel = static_cast<uint8_t>(channel);
+      strongestRssi = rssi;
+    }
+  }
+
+  WiFi.scanDelete();
+  stopRadio();
+  result.status = result.channel == AUTO_CHANNEL
+                      ? WifiChannelScanStatus::NotFound
+                      : WifiChannelScanStatus::Found;
+  return result;
 }
 
 void waitForButtonRelease() {
@@ -734,6 +849,30 @@ bool enterChannelSettingsMode() {
     if (stableButtonPressed && !settingsLongHandled &&
         elapsed(now, settingsPressStartedMs, BUTTON_LONG_PRESS_MS)) {
       settingsLongHandled = true;
+
+      if (selectedChannel == AUTO_CHANNEL) {
+        drawWifiScanScreen("Scanning...", config.wifi.ssid);
+        const WifiChannelScanResult scanResult = scanConfiguredWifiChannel();
+        if (scanResult.status == WifiChannelScanStatus::Found) {
+          config.channel = scanResult.channel;
+          const bool saved = saveConfig();
+          drawWifiScanScreen(String("Found CH ") + String(scanResult.channel),
+                             saved ? "Saved" : "Save failed");
+          delay(CHANNEL_SETTINGS_RESULT_MS);
+          waitForButtonRelease();
+          return saved;
+        }
+
+        drawWifiScanScreen(
+            scanResult.status == WifiChannelScanStatus::NotFound
+                ? String("SSID not found")
+                : String("Scan failed"),
+            config.wifi.ssid);
+        delay(CHANNEL_SETTINGS_RESULT_MS);
+        waitForButtonRelease();
+        return false;
+      }
+
       config.channel = selectedChannel;
       const bool saved = saveConfig();
       drawChannelSettingsScreen(selectedChannel, saved ? "Saved" : "Save failed");
