@@ -15,6 +15,10 @@ directly on the device. In practice, it is a handheld remote for
 - Shows battery/status information on an ST7567/U8g2 LCD.
 - Supports USB-powered standby mode and battery-triggered send-and-power-off mode.
 - Allows channel selection from `CH 1` to `CH 13` with the single button.
+- Connects to Wi-Fi only in USB mode and only when both Wi-Fi fields are set.
+- Provides a status/configuration web page at `http://remotebox.local/`.
+- Advertises HTTP and ESPOTA through mDNS and accepts PlatformIO ESPOTA updates.
+- Synchronizes the saved ESP-NOW channel to the connected access point channel.
 
 ## Hardware
 
@@ -63,10 +67,10 @@ device if missing or invalid:
 
 Fields:
 
-- `wifi.ssid`: Optional Wi-Fi SSID used by automatic channel detection. When
-  non-empty, channel settings include an `AUTO` item.
-- `wifi.password`: Reserved Wi-Fi password field. Automatic channel detection
-  only scans for the SSID and does not connect to the network.
+- `wifi.ssid`: Wi-Fi SSID. A non-empty SSID also enables the `AUTO` channel
+  selection item.
+- `wifi.password`: Wi-Fi password. Network services are disabled unless both
+  `wifi.ssid` and `wifi.password` are non-empty.
 - `id`: Sender ID included in every command packet.
 - `name`: Friendly device name shown on the LCD.
 - `to`: Target device name or ID included in every command packet.
@@ -92,6 +96,27 @@ When USB is connected:
 - Short press/release: send the configured `cmd`.
 - Long press for 2 seconds: enter channel settings.
 - The screen stays available while USB is present and dims after idle time.
+- With complete Wi-Fi credentials, the device connects to Wi-Fi and starts the
+  web console, mDNS, and ESPOTA. These services stop as soon as USB is removed.
+- The standby screen shows IP address, synchronized channel, device name,
+  command, and target. With incomplete credentials it shows `Wifi disabled`.
+
+## Web Console and ESPOTA
+
+After Wi-Fi connects in USB mode, open either:
+
+- `http://remotebox.local/`
+- the IP address shown on the LCD
+
+The page shows device, network, battery, ESP-NOW, memory, and filesystem status.
+It can load, format, validate, and save `/config.json`. The browser checks JSON
+syntax first; the firmware then validates required fields, types, lengths,
+ranges, `data`, and the resulting ESP-NOW packet size. Saving uses a temporary
+file and backup replacement to reduce the risk of a partial write.
+
+When Wi-Fi credentials are changed from the page, the HTTP response is sent
+before the device reconnects with the new values. The web console intentionally
+has no authentication, so use it only on a trusted network.
 
 ### Channel Settings
 
@@ -146,6 +171,9 @@ For example, the checksum source is shaped like:
 ## Channel Notes
 
 The sender and receiver should normally use the same ESP-NOW channel.
+Whenever Wi-Fi connects successfully in USB mode, the access point's actual
+channel is authoritative. If it differs from `config.json`, the firmware updates
+and saves the local `channel` automatically before starting network services.
 Adjacent 2.4 GHz Wi-Fi channels overlap, so very nearby devices may sometimes
 receive packets on neighboring channels such as `CH10`, `CH11`, and `CH12`.
 Do not rely on that behavior for real use. Use wider tests such as `CH1`,
@@ -173,6 +201,10 @@ Upload firmware:
 pio run -t upload
 ```
 
+The partition table now contains two OTA application slots. Flash this build by
+USB at least once before using ESPOTA; the existing LittleFS offset and size are
+kept unchanged.
+
 Upload LittleFS data:
 
 ```powershell
@@ -185,12 +217,21 @@ Open serial monitor:
 pio device monitor
 ```
 
+Upload later firmware builds through ESPOTA (device must be connected to USB
+power and Wi-Fi):
+
+```powershell
+pio run -e remote_box_ota -t upload
+```
+
 ## Project Layout
 
 ```text
 .
 |-- data/
 |   `-- config.json
+|-- include/
+|   `-- WebPage.h
 |-- doc/
 |   |-- BOM / schematic / PCB references
 |   `-- LCD notes and images

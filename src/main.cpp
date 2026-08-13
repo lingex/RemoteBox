@@ -1,8 +1,11 @@
 #include <Arduino.h>
+#include <ArduinoOTA.h>
 #include <ArduinoJson.h>
+#include <ESPmDNS.h>
 #include <FS.h>
 #include <LittleFS.h>
 #include <U8g2lib.h>
+#include <WebServer.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_sleep.h>
@@ -10,6 +13,7 @@
 #include <driver/gpio.h>
 
 #include "Checksum.h"
+#include "WebPage.h"
 
 #ifndef ESP_ARDUINO_VERSION_MAJOR
 #define ESP_ARDUINO_VERSION_MAJOR 2
@@ -34,6 +38,9 @@ constexpr uint8_t LCD_BL_PWM_BITS = 8;
 constexpr uint8_t LCD_BL_PWM_MAX = (1 << LCD_BL_PWM_BITS) - 1;
 
 constexpr char CONFIG_PATH[] = "/config.json";
+constexpr char CONFIG_TEMP_PATH[] = "/.config.tmp";
+constexpr char CONFIG_BACKUP_PATH[] = "/.config.bak";
+constexpr char NETWORK_HOSTNAME[] = "remotebox";
 constexpr char DEFAULT_ID[] = "remote-001";
 constexpr char DEFAULT_NAME[] = "RemoteBox";
 constexpr char DEFAULT_TO[] = "IRStation-01";
@@ -54,6 +61,7 @@ constexpr size_t MAX_DATA_JSON_LEN = 96;
 constexpr size_t MAX_WIFI_SSID_LEN = 32;
 constexpr size_t MAX_WIFI_PASSWORD_LEN = 64;
 constexpr size_t ESPNOW_PAYLOAD_MAX_LEN = 250;
+constexpr size_t MAX_CONFIG_FILE_LEN = 4096;
 
 constexpr uint32_t RESULT_VISIBLE_MS = 3UL * 1000UL;
 constexpr uint32_t USB_STATUS_VISIBLE_MS = 3UL * 1000UL;
@@ -68,6 +76,10 @@ constexpr uint32_t BATTERY_REFRESH_MS = 8UL * 1000UL;
 constexpr uint8_t COMMAND_SEND_ATTEMPTS = 3;
 constexpr uint32_t ESPNOW_SEND_WAIT_MS = 500UL;
 constexpr uint32_t ESPNOW_SEND_GAP_MS = 35UL;
+constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15UL * 1000UL;
+constexpr uint32_t WIFI_RETRY_MS = 60UL * 1000UL;
+constexpr uint32_t WIFI_RESTART_DELAY_MS = 800UL;
+constexpr uint32_t REBOOT_DELAY_MS = 500UL;
 constexpr float BATTERY_DIVIDER_RATIO = 2.0f;
 
 constexpr uint8_t ESPNOW_BROADCAST_MAC[6] = {
@@ -132,11 +144,22 @@ DeviceConfig config;
 BatteryReading battery;
 U8G2_ST7567_ERC12864_F_4W_SW_SPI u8g2(
     U8G2_R0, PIN_LCD_SCK, PIN_LCD_SDA, U8X8_PIN_NONE, PIN_LCD_DC, PIN_LCD_RST);
+WebServer webServer(80);
 
 bool usbPresent = false;
 bool backlightOn = false;
 bool espNowInitialized = false;
 bool wifiRadioStarted = false;
+bool wifiAttemptActive = false;
+bool wifiRestartPending = false;
+bool webRoutesConfigured = false;
+bool webServerStarted = false;
+bool mdnsStarted = false;
+bool arduinoOtaConfigured = false;
+bool arduinoOtaStarted = false;
+bool otaInProgress = false;
+bool rebootPending = false;
+uint8_t otaLastProgress = UINT8_MAX;
 bool lastButtonRaw = false;
 bool stableButtonPressed = false;
 bool buttonLongHandled = false;
@@ -149,11 +172,19 @@ uint8_t batteryChargeFrame = 0;
 uint16_t commandSequence = 0;
 String usbStatusLine;
 uint32_t usbStatusUntilMs = 0;
+uint32_t wifiAttemptStartedMs = 0;
+uint32_t nextWifiAttemptMs = 0;
+uint32_t wifiRestartAtMs = 0;
+uint32_t nextChannelSyncAttemptMs = 0;
+uint32_t rebootAtMs = 0;
 
 volatile bool espNowSendComplete = false;
 volatile esp_now_send_status_t espNowLastStatus = ESP_NOW_SEND_FAIL;
 
 void setupButtonState();
+bool hasCompleteWifiConfig();
+void stopNetworkServices();
+void serviceNetwork();
 
 bool elapsed(uint32_t now, uint32_t since, uint32_t interval) {
   return static_cast<uint32_t>(now - since) >= interval;
@@ -259,18 +290,24 @@ void holdPowerOff() {
   digitalWrite(PIN_PWR_EN, LOW);
 }
 
-void stopRadio() {
+void stopEspNow() {
   if (espNowInitialized) {
     esp_now_deinit();
     espNowInitialized = false;
   }
+}
 
-  if (wifiRadioStarted) {
-    WiFi.disconnect(true, true);
+void stopRadio() {
+  stopNetworkServices();
+  stopEspNow();
+
+  if (wifiRadioStarted || WiFi.getMode() != WIFI_OFF) {
+    WiFi.disconnect(true, false);
     WiFi.mode(WIFI_OFF);
     esp_wifi_stop();
     wifiRadioStarted = false;
   }
+  wifiAttemptActive = false;
 }
 
 String makeCommandUid() {
@@ -411,14 +448,31 @@ void drawChargeScreen() {
   u8g2.clearBuffer();
   drawHeader("USB");
 
-  const bool statusActive = !usbStatusLine.isEmpty() &&
-                            static_cast<int32_t>(usbStatusUntilMs - millis()) > 0;
-  u8g2.setFont(u8g2_font_7x13_tf);
-  drawCenteredString(31, statusActive ? usbStatusLine : String("Ready"));
-  u8g2.setFont(u8g2_font_6x10_tf);
-  drawCenteredString(45, "Target: " + String(config.to));
+  const bool statusActive = otaInProgress ||
+                            (!usbStatusLine.isEmpty() &&
+                             static_cast<int32_t>(usbStatusUntilMs - millis()) >
+                                 0);
+  String networkLine;
+  if (!hasCompleteWifiConfig()) {
+    networkLine = "Wifi disabled";
+  } else if (WiFi.status() == WL_CONNECTED) {
+    networkLine = "IP:" + WiFi.localIP().toString();
+  } else if (wifiAttemptActive) {
+    networkLine = "Wifi connecting";
+  } else {
+    networkLine = "Wifi offline";
+  }
+  networkLine += " CH:" + String(config.channel);
 
-  drawFooter(config.name, String("CH ") + String(config.channel));
+  u8g2.setFont(u8g2_font_5x8_tf);
+  u8g2.drawStr(1, 23, fitTextToWidth(networkLine, 126).c_str());
+  const String idLine =
+      statusActive ? "Status:" + usbStatusLine : "ID:" + config.name;
+  u8g2.drawStr(1, 34, fitTextToWidth(idLine, 126).c_str());
+  u8g2.drawStr(1, 47,
+               fitTextToWidth("CMD:" + config.cmd, 126).c_str());
+  u8g2.drawStr(1, 59,
+               fitTextToWidth("Target:" + config.to, 126).c_str());
   u8g2.sendBuffer();
 }
 
@@ -457,46 +511,210 @@ void drawWifiScanScreen(const String &status, const String &detail) {
   u8g2.sendBuffer();
 }
 
-void saveDefaultConfig() {
-  File file = LittleFS.open(CONFIG_PATH, "w");
-  if (!file) {
-    return;
-  }
-
-  StaticJsonDocument<512> doc;
+String serializeConfig(const DeviceConfig &value) {
+  StaticJsonDocument<768> doc;
   JsonObject wifi = doc.createNestedObject("wifi");
-  wifi["ssid"] = DEFAULT_WIFI_SSID;
-  wifi["password"] = DEFAULT_WIFI_PASSWORD;
-  doc["id"] = DEFAULT_ID;
-  doc["name"] = DEFAULT_NAME;
-  doc["to"] = DEFAULT_TO;
-  doc["cmd"] = DEFAULT_CMD;
-  doc["data"] = serialized(DEFAULT_DATA_JSON);
-  doc["channel"] = DEFAULT_CHANNEL;
-  doc["backlightBrightness"] = DEFAULT_BACKLIGHT_BRIGHTNESS;
-  serializeJsonPretty(doc, file);
-  file.println();
+  wifi["ssid"] = value.wifi.ssid;
+  wifi["password"] = value.wifi.password;
+  doc["id"] = value.id;
+  doc["name"] = value.name;
+  doc["to"] = value.to;
+  doc["cmd"] = value.cmd;
+  doc["data"] = serialized(value.dataJson);
+  doc["channel"] = value.channel;
+  doc["backlightBrightness"] = value.backlightBrightness;
+  String output;
+  serializeJsonPretty(doc, output);
+  output += '\n';
+  return output;
 }
 
-bool saveConfig() {
-  File file = LittleFS.open(CONFIG_PATH, "w");
-  if (!file) {
+bool writeConfigAtomically(const String &json, String &error) {
+  LittleFS.remove(CONFIG_TEMP_PATH);
+  File temp = LittleFS.open(CONFIG_TEMP_PATH, "w");
+  if (!temp) {
+    error = "Unable to create temporary config file";
     return false;
   }
 
-  StaticJsonDocument<768> doc;
-  JsonObject wifi = doc.createNestedObject("wifi");
-  wifi["ssid"] = config.wifi.ssid;
-  wifi["password"] = config.wifi.password;
-  doc["id"] = config.id;
-  doc["name"] = config.name;
-  doc["to"] = config.to;
-  doc["cmd"] = config.cmd;
-  doc["data"] = serialized(config.dataJson);
-  doc["channel"] = config.channel;
-  doc["backlightBrightness"] = config.backlightBrightness;
-  serializeJsonPretty(doc, file);
-  file.println();
+  const size_t written = temp.print(json);
+  if (!json.endsWith("\n")) {
+    temp.println();
+  }
+  temp.close();
+  if (written != json.length()) {
+    LittleFS.remove(CONFIG_TEMP_PATH);
+    error = "Incomplete config write";
+    return false;
+  }
+
+  LittleFS.remove(CONFIG_BACKUP_PATH);
+  const bool hadConfig = LittleFS.exists(CONFIG_PATH);
+  if (hadConfig && !LittleFS.rename(CONFIG_PATH, CONFIG_BACKUP_PATH)) {
+    LittleFS.remove(CONFIG_TEMP_PATH);
+    error = "Unable to back up config.json";
+    return false;
+  }
+  if (!LittleFS.rename(CONFIG_TEMP_PATH, CONFIG_PATH)) {
+    if (hadConfig) {
+      LittleFS.rename(CONFIG_BACKUP_PATH, CONFIG_PATH);
+    }
+    LittleFS.remove(CONFIG_TEMP_PATH);
+    error = "Unable to replace config.json";
+    return false;
+  }
+
+  LittleFS.remove(CONFIG_BACKUP_PATH);
+  error = "";
+  return true;
+}
+
+void saveDefaultConfig() {
+  String error;
+  writeConfigAtomically(serializeConfig(DeviceConfig()), error);
+}
+
+bool saveConfig() {
+  String error;
+  const bool saved = writeConfigAtomically(serializeConfig(config), error);
+  if (!saved) {
+    Serial.println("Config save failed: " + error);
+  }
+  return saved;
+}
+
+String readRawConfig(String &error) {
+  error = "";
+  File file = LittleFS.open(CONFIG_PATH, "r");
+  if (!file) {
+    error = "Unable to open config.json";
+    return "";
+  }
+  if (file.size() > MAX_CONFIG_FILE_LEN) {
+    file.close();
+    error = "config.json exceeds 4096 bytes";
+    return "";
+  }
+  String raw = file.readString();
+  file.close();
+  return raw;
+}
+
+bool requireConfigString(JsonVariantConst value, const char *field,
+                         size_t maxLength, bool allowEmpty, String &output,
+                         String &error) {
+  if (!value.is<const char *>()) {
+    error = String(field) + " must be a string";
+    return false;
+  }
+  output = value.as<const char *>();
+  if (output.length() > maxLength) {
+    error = String(field) + " must not exceed " + String(maxLength) +
+            " bytes";
+    return false;
+  }
+  String trimmed = output;
+  trimmed.trim();
+  if (!allowEmpty && trimmed.isEmpty()) {
+    error = String(field) + " must not be empty";
+    return false;
+  }
+  return true;
+}
+
+bool parseAndValidateConfig(const String &json, DeviceConfig &parsed,
+                            String &error) {
+  if (json.isEmpty()) {
+    error = "config.json is empty";
+    return false;
+  }
+  if (json.length() > MAX_CONFIG_FILE_LEN) {
+    error = "config.json exceeds 4096 bytes";
+    return false;
+  }
+
+  DynamicJsonDocument doc(2048);
+  const DeserializationError jsonError = deserializeJson(doc, json);
+  if (jsonError) {
+    error = "Invalid JSON: " + String(jsonError.c_str());
+    return false;
+  }
+  if (!doc.is<JsonObject>()) {
+    error = "The JSON root must be an object";
+    return false;
+  }
+
+  JsonObjectConst root = doc.as<JsonObjectConst>();
+  if (!root["wifi"].is<JsonObjectConst>()) {
+    error = "wifi must be an object";
+    return false;
+  }
+  JsonObjectConst wifi = root["wifi"].as<JsonObjectConst>();
+  DeviceConfig candidate;
+  if (!requireConfigString(wifi["ssid"], "wifi.ssid", MAX_WIFI_SSID_LEN,
+                           true, candidate.wifi.ssid, error) ||
+      !requireConfigString(wifi["password"], "wifi.password",
+                           MAX_WIFI_PASSWORD_LEN, true,
+                           candidate.wifi.password, error) ||
+      !requireConfigString(root["id"], "id", MAX_ID_LEN, false,
+                           candidate.id, error) ||
+      !requireConfigString(root["name"], "name", MAX_NAME_LEN, false,
+                           candidate.name, error) ||
+      !requireConfigString(root["to"], "to", MAX_TO_LEN, false,
+                           candidate.to, error) ||
+      !requireConfigString(root["cmd"], "cmd", MAX_CMD_LEN, false,
+                           candidate.cmd, error)) {
+    return false;
+  }
+
+  if (!root["data"].is<JsonObjectConst>()) {
+    error = "data must be an object";
+    return false;
+  }
+  candidate.dataJson = "";
+  serializeJson(root["data"], candidate.dataJson);
+  if (candidate.dataJson.length() > MAX_DATA_JSON_LEN) {
+    error = "Serialized data must not exceed 96 bytes";
+    return false;
+  }
+
+  if (!root["channel"].is<int>()) {
+    error = "channel must be an integer";
+    return false;
+  }
+  const int channel = root["channel"].as<int>();
+  if (channel < MIN_CHANNEL || channel > MAX_CHANNEL) {
+    error = "channel must be 1-13";
+    return false;
+  }
+  candidate.channel = static_cast<uint8_t>(channel);
+
+  if (!root["backlightBrightness"].is<int>()) {
+    error = "backlightBrightness must be an integer";
+    return false;
+  }
+  const int brightness = root["backlightBrightness"].as<int>();
+  if (brightness < 0 || brightness > 100) {
+    error = "backlightBrightness must be 0-100";
+    return false;
+  }
+  candidate.backlightBrightness = static_cast<uint8_t>(brightness);
+
+  StaticJsonDocument<384> packet;
+  packet["id"] = candidate.id;
+  packet["uid"] = "FFFFFFFF-FFFF-FFFF";
+  packet["to"] = candidate.to;
+  packet["cmd"] = candidate.cmd;
+  packet["dat"] = serialized(candidate.dataJson);
+  packet["bat"] = 100;
+  packet["chk"] = "FFFFFFFF";
+  if (measureJson(packet) >= ESPNOW_PAYLOAD_MAX_LEN) {
+    error = "id/to/cmd/data make the ESP-NOW packet exceed 249 bytes";
+    return false;
+  }
+
+  parsed = candidate;
+  error = "";
   return true;
 }
 
@@ -563,6 +781,301 @@ void loadConfig() {
   }
 }
 
+bool hasCompleteWifiConfig() {
+  String ssid = config.wifi.ssid;
+  String password = config.wifi.password;
+  ssid.trim();
+  password.trim();
+  return !ssid.isEmpty() && !password.isEmpty();
+}
+
+void sendWebJsonError(int statusCode, const String &message) {
+  DynamicJsonDocument doc(256);
+  doc["ok"] = false;
+  doc["error"] = message;
+  String response;
+  serializeJson(doc, response);
+  webServer.send(statusCode, "application/json", response);
+}
+
+void handleWebStatus() {
+  DynamicJsonDocument doc(1024);
+  doc["name"] = config.name;
+  doc["id"] = config.id;
+  doc["target"] = config.to;
+  doc["command"] = config.cmd;
+  doc["espnowChannel"] = config.channel;
+  doc["ip"] = WiFi.localIP().toString();
+  doc["mac"] = WiFi.macAddress();
+  doc["ssid"] = WiFi.SSID();
+  doc["rssi"] = WiFi.RSSI();
+  doc["wifiChannel"] = WiFi.channel();
+  doc["mdns"] = NETWORK_HOSTNAME;
+  doc["uptime"] = millis() / 1000UL;
+  doc["freeHeap"] = ESP.getFreeHeap();
+  doc["fsUsed"] = LittleFS.usedBytes();
+  doc["fsTotal"] = LittleFS.totalBytes();
+  doc["batteryMillivolts"] = battery.millivolts;
+  doc["batteryPercent"] = battery.percent;
+  doc["usbPresent"] = usbPresent;
+  doc["otaActive"] = otaInProgress;
+  String response;
+  serializeJson(doc, response);
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(200, "application/json", response);
+}
+
+void handleWebConfigGet() {
+  String error;
+  const String raw = readRawConfig(error);
+  if (!error.isEmpty()) {
+    sendWebJsonError(500, error);
+    return;
+  }
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(200, "application/json; charset=utf-8", raw);
+}
+
+void handleWebConfigSave() {
+  DeviceConfig updated;
+  String error;
+  const String body = webServer.arg("plain");
+  if (!parseAndValidateConfig(body, updated, error)) {
+    sendWebJsonError(400, error);
+    return;
+  }
+
+  const bool wifiChanged = updated.wifi.ssid != config.wifi.ssid ||
+                           updated.wifi.password != config.wifi.password;
+  if (!writeConfigAtomically(body, error)) {
+    sendWebJsonError(500, error);
+    return;
+  }
+
+  config = updated;
+  setBacklight(backlightOn);
+  if (mdnsStarted) {
+    MDNS.setInstanceName(config.name);
+  }
+  DynamicJsonDocument responseDoc(192);
+  responseDoc["ok"] = true;
+  responseDoc["saved"] = true;
+  responseDoc["wifiChanged"] = wifiChanged;
+  String response;
+  serializeJson(responseDoc, response);
+  webServer.send(200, "application/json", response);
+
+  if (wifiChanged) {
+    wifiRestartPending = true;
+    wifiRestartAtMs = millis() + WIFI_RESTART_DELAY_MS;
+  }
+}
+
+void configureWebRoutes() {
+  if (webRoutesConfigured) {
+    return;
+  }
+  webServer.on("/", HTTP_GET, []() {
+    webServer.sendHeader("Cache-Control", "no-store");
+    webServer.send_P(200, "text/html; charset=utf-8", WEB_INDEX_HTML);
+  });
+  webServer.on("/api/status", HTTP_GET, handleWebStatus);
+  webServer.on("/api/config", HTTP_GET, handleWebConfigGet);
+  webServer.on("/api/config", HTTP_PUT, handleWebConfigSave);
+  webServer.on("/api/config", HTTP_POST, handleWebConfigSave);
+  webServer.on("/api/reboot", HTTP_POST, []() {
+    webServer.send(200, "application/json",
+                   "{\"ok\":true,\"restarting\":true}");
+    rebootPending = true;
+    rebootAtMs = millis() + REBOOT_DELAY_MS;
+  });
+  webServer.onNotFound([]() { sendWebJsonError(404, "Not found"); });
+  webRoutesConfigured = true;
+}
+
+void configureArduinoOta() {
+  if (arduinoOtaConfigured) {
+    return;
+  }
+  ArduinoOTA.setHostname(NETWORK_HOSTNAME);
+  ArduinoOTA.setPort(3232);
+  ArduinoOTA.setPartitionLabel("littlefs");
+  ArduinoOTA.setRebootOnSuccess(true);
+  ArduinoOTA.setMdnsEnabled(false);
+  ArduinoOTA.onStart([]() {
+    otaInProgress = true;
+    otaLastProgress = UINT8_MAX;
+    setBacklight(true);
+    usbStatusLine = "OTA updating";
+    usbStatusUntilMs = UINT32_MAX;
+    drawChargeScreen();
+    Serial.println("ESPOTA update started");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    const uint8_t percent = total == 0
+                                ? 0
+                                : static_cast<uint8_t>(
+                                      (progress * 100ULL) / total);
+    if (otaLastProgress == UINT8_MAX || percent >= otaLastProgress + 10 ||
+        percent == 100) {
+      otaLastProgress = percent;
+      usbStatusLine = "OTA " + String(percent) + "%";
+      drawChargeScreen();
+      Serial.printf("ESPOTA progress: %u%%\n", percent);
+    }
+  });
+  ArduinoOTA.onEnd([]() {
+    usbStatusLine = "OTA complete";
+    usbStatusUntilMs = millis() + USB_STATUS_VISIBLE_MS;
+    drawChargeScreen();
+    Serial.println("ESPOTA update complete");
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    otaInProgress = false;
+    usbStatusLine = "OTA error " + String(static_cast<unsigned>(error));
+    usbStatusUntilMs = millis() + USB_STATUS_VISIBLE_MS;
+    drawChargeScreen();
+    Serial.printf("ESPOTA error: %u\n", static_cast<unsigned>(error));
+  });
+  arduinoOtaConfigured = true;
+}
+
+void startNetworkServices() {
+  if (!usbPresent || !hasCompleteWifiConfig() ||
+      WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  configureWebRoutes();
+  configureArduinoOta();
+  if (!mdnsStarted) {
+    mdnsStarted = MDNS.begin(NETWORK_HOSTNAME);
+    if (mdnsStarted) {
+      MDNS.setInstanceName(config.name);
+      MDNS.addService("http", "tcp", 80);
+      MDNS.enableArduino(3232, false);
+    } else {
+      Serial.println("mDNS start failed");
+    }
+  }
+  if (!webServerStarted) {
+    webServer.begin();
+    webServerStarted = true;
+  }
+  if (!arduinoOtaStarted) {
+    ArduinoOTA.begin();
+    arduinoOtaStarted = true;
+  }
+}
+
+void stopNetworkServices() {
+  if (arduinoOtaStarted) {
+    ArduinoOTA.end();
+    arduinoOtaStarted = false;
+  }
+  if (webServerStarted) {
+    webServer.stop();
+    webServerStarted = false;
+  }
+  if (mdnsStarted) {
+    MDNS.end();
+    mdnsStarted = false;
+  }
+  otaInProgress = false;
+}
+
+void startWifiAttempt() {
+  if (!usbPresent || !readUsbPresent() || !hasCompleteWifiConfig()) {
+    stopRadio();
+    nextWifiAttemptMs = millis() + WIFI_RETRY_MS;
+    return;
+  }
+
+  stopRadio();
+  WiFi.persistent(false);
+  if (!WiFi.mode(WIFI_STA)) {
+    nextWifiAttemptMs = millis() + WIFI_RETRY_MS;
+    return;
+  }
+  wifiRadioStarted = true;
+  WiFi.setHostname(NETWORK_HOSTNAME);
+  WiFi.setSleep(true);
+  WiFi.setAutoReconnect(false);
+  WiFi.begin(config.wifi.ssid.c_str(), config.wifi.password.c_str());
+  wifiAttemptActive = true;
+  wifiAttemptStartedMs = millis();
+  nextChannelSyncAttemptMs = wifiAttemptStartedMs;
+  Serial.println("Connecting Wi-Fi: " + config.wifi.ssid);
+}
+
+void syncConnectedWifiChannel(uint32_t now) {
+  const int actualChannel = WiFi.channel();
+  if (actualChannel < MIN_CHANNEL || actualChannel > MAX_CHANNEL ||
+      actualChannel == config.channel ||
+      static_cast<int32_t>(now - nextChannelSyncAttemptMs) < 0) {
+    return;
+  }
+
+  nextChannelSyncAttemptMs = now + WIFI_RETRY_MS;
+  const uint8_t previousChannel = config.channel;
+  config.channel = static_cast<uint8_t>(actualChannel);
+  if (saveConfig()) {
+    Serial.printf("Wi-Fi channel synchronized: CH%u -> CH%d\n",
+                  previousChannel, actualChannel);
+    drawChargeScreen();
+  } else {
+    config.channel = previousChannel;
+  }
+}
+
+void serviceNetwork() {
+  const uint32_t now = millis();
+  if (rebootPending && static_cast<int32_t>(now - rebootAtMs) >= 0) {
+    ESP.restart();
+  }
+
+  if (!usbPresent || !readUsbPresent() || !hasCompleteWifiConfig()) {
+    if (wifiRadioStarted || webServerStarted || arduinoOtaStarted ||
+        mdnsStarted) {
+      stopRadio();
+    }
+    return;
+  }
+
+  if (wifiRestartPending &&
+      static_cast<int32_t>(now - wifiRestartAtMs) >= 0) {
+    wifiRestartPending = false;
+    startWifiAttempt();
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiAttemptActive = false;
+    syncConnectedWifiChannel(now);
+    startNetworkServices();
+    webServer.handleClient();
+    if (arduinoOtaStarted) {
+      ArduinoOTA.handle();
+    }
+    return;
+  }
+
+  stopNetworkServices();
+  if (wifiAttemptActive &&
+      elapsed(now, wifiAttemptStartedMs, WIFI_CONNECT_TIMEOUT_MS)) {
+    WiFi.disconnect(false, false);
+    wifiAttemptActive = false;
+    nextWifiAttemptMs = now + WIFI_RETRY_MS;
+    Serial.println("Wi-Fi connection timed out; retry in 60 seconds");
+    return;
+  }
+
+  if (!wifiAttemptActive &&
+      static_cast<int32_t>(now - nextWifiAttemptMs) >= 0) {
+    startWifiAttempt();
+  }
+}
+
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
 void onEspNowSent(const wifi_tx_info_t *, esp_now_send_status_t status) {
 #else
@@ -573,26 +1086,39 @@ void onEspNowSent(const uint8_t *, esp_now_send_status_t status) {
 }
 
 SendResult sendEspNowCommand() {
-  stopRadio();
+  const bool preserveConnectedWifi =
+      usbPresent && readUsbPresent() && hasCompleteWifiConfig() &&
+      WiFi.status() == WL_CONNECTED;
+  stopEspNow();
 
-  if (!WiFi.mode(WIFI_STA)) {
-    return SendResult::Error;
-  }
-  wifiRadioStarted = true;
-  WiFi.disconnect();
-  yield();
-
-  esp_wifi_set_promiscuous(true);
-  esp_err_t channelErr =
-      esp_wifi_set_channel(config.channel, WIFI_SECOND_CHAN_NONE);
-  esp_wifi_set_promiscuous(false);
-  if (channelErr != ESP_OK) {
+  if (!preserveConnectedWifi) {
     stopRadio();
-    return SendResult::Error;
+    if (!WiFi.mode(WIFI_STA)) {
+      return SendResult::Error;
+    }
+    wifiRadioStarted = true;
+    WiFi.disconnect();
+    yield();
+
+    esp_wifi_set_promiscuous(true);
+    const esp_err_t channelErr =
+        esp_wifi_set_channel(config.channel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+    if (channelErr != ESP_OK) {
+      stopRadio();
+      return SendResult::Error;
+    }
   }
+
+  const auto finishRadioUse = [preserveConnectedWifi]() {
+    stopEspNow();
+    if (!preserveConnectedWifi) {
+      stopRadio();
+    }
+  };
 
   if (esp_now_init() != ESP_OK) {
-    stopRadio();
+    finishRadioUse();
     return SendResult::Error;
   }
   espNowInitialized = true;
@@ -601,7 +1127,7 @@ SendResult sendEspNowCommand() {
 
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, ESPNOW_BROADCAST_MAC, sizeof(ESPNOW_BROADCAST_MAC));
-  peerInfo.channel = config.channel;
+  peerInfo.channel = preserveConnectedWifi ? 0 : config.channel;
   peerInfo.encrypt = false;
 #ifdef WIFI_IF_STA
   peerInfo.ifidx = WIFI_IF_STA;
@@ -609,7 +1135,7 @@ SendResult sendEspNowCommand() {
 
   if (!esp_now_is_peer_exist(ESPNOW_BROADCAST_MAC)) {
     if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-      stopRadio();
+      finishRadioUse();
       return SendResult::Error;
     }
   }
@@ -627,7 +1153,7 @@ SendResult sendEspNowCommand() {
   char payload[ESPNOW_PAYLOAD_MAX_LEN];
   const size_t payloadSize = serializeJson(doc, payload, sizeof(payload));
   if (payloadSize == 0 || payloadSize >= sizeof(payload)) {
-    stopRadio();
+    finishRadioUse();
     return SendResult::Error;
   }
 
@@ -659,7 +1185,7 @@ SendResult sendEspNowCommand() {
     }
   }
 
-  stopRadio();
+  finishRadioUse();
 
   if (anySuccess) {
     return SendResult::Ok;
@@ -838,6 +1364,9 @@ bool enterChannelSettingsMode() {
 
   while (true) {
     const uint32_t now = millis();
+    if (usbPresent) {
+      serviceNetwork();
+    }
     const ButtonEvent event = pollButtonEvent();
 
     if (event == ButtonEvent::Pressed) {
@@ -903,11 +1432,19 @@ void serviceChargeMode() {
   const uint32_t now = millis();
 
   if (!readUsbPresent()) {
+    usbPresent = false;
+    stopRadio();
     drawSendScreen("USB removed", "Powering off");
     delay(RESULT_VISIBLE_MS);
     setBacklight(false);
     delay(POST_BACKLIGHT_OFF_MS);
     shutdownNow();
+    return;
+  }
+
+  serviceNetwork();
+  if (otaInProgress) {
+    delay(2);
     return;
   }
 
@@ -949,8 +1486,10 @@ void serviceChargeMode() {
     lastUsbRefreshMs = now;
     ++batteryChargeFrame;
     refreshBattery();
-    const bool statusActive = !usbStatusLine.isEmpty() &&
-                              static_cast<int32_t>(usbStatusUntilMs - millis()) > 0;
+    const bool statusActive = otaInProgress ||
+                              (!usbStatusLine.isEmpty() &&
+                               static_cast<int32_t>(usbStatusUntilMs - millis()) >
+                                   0);
     if (!usbStatusLine.isEmpty() && !statusActive) {
       usbStatusLine = "";
     }
@@ -1012,6 +1551,13 @@ void setupStorage() {
     config = DeviceConfig();
     return;
   }
+  LittleFS.remove(CONFIG_TEMP_PATH);
+  if (!LittleFS.exists(CONFIG_PATH) &&
+      LittleFS.exists(CONFIG_BACKUP_PATH)) {
+    LittleFS.rename(CONFIG_BACKUP_PATH, CONFIG_PATH);
+  } else if (LittleFS.exists(CONFIG_BACKUP_PATH)) {
+    LittleFS.remove(CONFIG_BACKUP_PATH);
+  }
   loadConfig();
 }
 
@@ -1040,6 +1586,9 @@ void setup() {
   Serial.printf("Starting up: %s\n", usbPresent ? "USB charge" : "send trigger");
 
   if (usbPresent) {
+    if (hasCompleteWifiConfig()) {
+      startWifiAttempt();
+    }
     lastUsbActivityMs = millis();
     drawChargeScreen();
   } else {
