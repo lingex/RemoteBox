@@ -139,7 +139,7 @@ Each command is serialized as JSON before sending:
 ```json
 {
   "id": "remote-001",
-  "uid": "00001234-0001-A7F2",
+  "uid": "1234A7F2",
   "to": "IRStation-01",
   "cmd": "power",
   "dat": {},
@@ -150,6 +150,8 @@ Each command is serialized as JSON before sending:
 
 Notes:
 
+- `uid` is a random 32-bit value encoded as eight uppercase hexadecimal
+  characters (8 bytes in the JSON string).
 - The same JSON payload is sent three times for one button action.
 - All three repeats share the same `uid` and `chk`.
 - The receiver should deduplicate by `id + uid` and only execute a repeated
@@ -165,7 +167,7 @@ Notes:
 For example, the checksum source is shaped like:
 
 ```json
-{"bat":86,"cmd":"power","dat":{},"id":"remote-001","to":"IRStation-01","uid":"00001234-0001-A7F2"}
+{"bat":86,"cmd":"power","dat":{},"id":"remote-001","to":"IRStation-01","uid":"1234A7F2"}
 ```
 
 ## Channel Notes

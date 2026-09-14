@@ -172,7 +172,6 @@ uint32_t lastBatteryRefreshMs = 0;
 uint32_t lastUsbRefreshMs = 0;
 uint32_t lastUsbActivityMs = 0;
 uint8_t batteryChargeFrame = 0;
-uint16_t commandSequence = 0;
 String usbStatusLine;
 uint32_t usbStatusUntilMs = 0;
 uint32_t wifiAttemptStartedMs = 0;
@@ -314,13 +313,9 @@ void stopRadio() {
 }
 
 String makeCommandUid() {
-  ++commandSequence;
-
-  char output[18];
-  snprintf(output, sizeof(output), "%08lX-%04X-%04X",
-           static_cast<unsigned long>(millis()),
-           static_cast<unsigned int>(commandSequence),
-           static_cast<unsigned int>(esp_random() & 0xFFFF));
+  char output[9];
+  snprintf(output, sizeof(output), "%08lX",
+           static_cast<unsigned long>(esp_random()));
   return String(output);
 }
 
@@ -716,7 +711,7 @@ bool parseAndValidateConfig(const String &json, DeviceConfig &parsed,
 
   StaticJsonDocument<384> packet;
   packet["id"] = candidate.id;
-  packet["uid"] = "FFFFFFFF-FFFF-FFFF";
+  packet["uid"] = "FFFFFFFF";
   packet["to"] = candidate.to;
   packet["cmd"] = candidate.cmd;
   packet["dat"] = serialized(candidate.dataJson);
