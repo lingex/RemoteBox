@@ -1,3 +1,4 @@
+#include <EasyConfigMaintenance.h>
 #include <Arduino.h>
 #include <ArduinoOTA.h>
 #include <ArduinoJson.h>
@@ -14,6 +15,8 @@
 
 #include "Checksum.h"
 #include "WebPage.h"
+
+EasyConfigMaintenance serialConfig(Serial, LittleFS, 4096);
 
 #ifndef ESP_ARDUINO_VERSION_MAJOR
 #define ESP_ARDUINO_VERSION_MAJOR 2
@@ -575,6 +578,7 @@ void saveDefaultConfig() {
 }
 
 bool saveConfig() {
+  if (serialConfig.restartRequired()) return false;
   String error;
   const bool saved = writeConfigAtomically(serializeConfig(config), error);
   if (!saved) {
@@ -1009,6 +1013,7 @@ void startWifiAttempt() {
 }
 
 void syncConnectedWifiChannel(uint32_t now) {
+  if (serialConfig.restartRequired()) return;
   const int actualChannel = WiFi.channel();
   if (actualChannel < MIN_CHANNEL || actualChannel > MAX_CHANNEL ||
       actualChannel == config.channel ||
@@ -1547,7 +1552,13 @@ void setupDisplay() {
 }
 
 void setupStorage() {
-  if (!LittleFS.begin(true, "/littlefs", 10, "littlefs")) {
+  const bool mounted = LittleFS.begin(false, "/littlefs", 10, "littlefs");
+  serialConfig.begin("RemoteBox", mounted,
+      [](const String &content, String &error) {
+        DeviceConfig candidate;
+        return parseAndValidateConfig(content, candidate, error);
+      }, [] { ESP.restart(); });
+  if (!mounted) {
     config = DeviceConfig();
     return;
   }
@@ -1571,6 +1582,7 @@ void setupButtonState() {
 
 void setup() {
   setupPins();
+  Serial.setRxBufferSize(2048);
   Serial.begin(115200);
   delay(5);
 
@@ -1598,6 +1610,7 @@ void setup() {
 }
 
 void loop() {
+  serialConfig.poll();
   if (usbPresent) {
     serviceChargeMode();
   }
