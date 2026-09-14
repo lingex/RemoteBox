@@ -459,22 +459,32 @@ void drawChargeScreen() {
   if (!hasCompleteWifiConfig()) {
     networkLine = "Wifi disabled";
   } else if (WiFi.status() == WL_CONNECTED) {
-    networkLine = "IP:" + WiFi.localIP().toString();
+    const String ip = WiFi.localIP().toString();
+    networkLine = "IP:" + ip + " CH:" + String(config.channel);
+    u8g2.setFont(u8g2_font_6x10_tf);
+    if (u8g2.getStrWidth(networkLine.c_str()) > 126) {
+      networkLine = "IP " + ip + " C" + String(config.channel);
+    }
+    if (u8g2.getStrWidth(networkLine.c_str()) > 126) {
+      networkLine = ip + " C" + String(config.channel);
+    }
   } else if (wifiAttemptActive) {
     networkLine = "Wifi connecting";
   } else {
     networkLine = "Wifi offline";
   }
-  networkLine += " CH:" + String(config.channel);
+  if (WiFi.status() != WL_CONNECTED) {
+    networkLine += " CH:" + String(config.channel);
+  }
 
-  u8g2.setFont(u8g2_font_5x8_tf);
-  u8g2.drawStr(1, 23, fitTextToWidth(networkLine, 126).c_str());
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(1, 24, fitTextToWidth(networkLine, 126).c_str());
   const String idLine =
       statusActive ? "Status:" + usbStatusLine : "ID:" + config.name;
-  u8g2.drawStr(1, 34, fitTextToWidth(idLine, 126).c_str());
-  u8g2.drawStr(1, 47,
+  u8g2.drawStr(1, 36, fitTextToWidth(idLine, 126).c_str());
+  u8g2.drawStr(1, 48,
                fitTextToWidth("CMD:" + config.cmd, 126).c_str());
-  u8g2.drawStr(1, 59,
+  u8g2.drawStr(1, 60,
                fitTextToWidth("Target:" + config.to, 126).c_str());
   u8g2.sendBuffer();
 }
